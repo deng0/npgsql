@@ -35,11 +35,23 @@ using NpgsqlTypes;
 namespace Npgsql.TypeHandlers
 {
     /// <summary>
+    /// Global PostgisConfig.
+    /// </summary>
+    public static class PostgisConfig
+    {
+        /// <summary>
+        /// Whether PostGIS geometries should be parsed.
+        /// </summary>
+        public static bool ParseGeometries = true;
+    }
+
+    /// <summary>
     /// Type Handler for the postgis geometry type.
     /// </summary>
     [TypeMapping("geometry", NpgsqlDbType.Geometry, new[]
     {
         typeof(PostgisGeometry),
+        typeof(PostgisRawGeometry),
         typeof(PostgisPoint),
         typeof(PostgisMultiPoint),
         typeof(PostgisLineString),
@@ -49,6 +61,7 @@ namespace Npgsql.TypeHandlers
         typeof(PostgisGeometryCollection),
     })]
     class PostgisGeometryHandler : ChunkingTypeHandler<PostgisGeometry>,
+        IChunkingTypeHandler<PostgisRawGeometry>,
         IChunkingTypeHandler<PostgisPoint>, IChunkingTypeHandler<PostgisMultiPoint>,
         IChunkingTypeHandler<PostgisLineString>, IChunkingTypeHandler<PostgisMultiLineString>,
         IChunkingTypeHandler<PostgisPolygon>, IChunkingTypeHandler<PostgisMultiPolygon>,
@@ -76,6 +89,11 @@ namespace Npgsql.TypeHandlers
 
         public override async ValueTask<PostgisGeometry> Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription = null)
         {
+            return await Read(buf, len, async, fieldDescription, PostgisConfig.ParseGeometries);
+        }
+
+        async ValueTask<PostgisGeometry> Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription, bool parseGeometry)
+        {
             await buf.Ensure(5, async);
             var bo = (ByteOrder)buf.ReadByte();
             var id = buf.ReadUInt32(bo);
@@ -85,6 +103,40 @@ namespace Npgsql.TypeHandlers
             {
                 await buf.Ensure(4, async);
                 srid = buf.ReadUInt32(bo);
+                id &= ~(uint)EwkbModifiers.HasSRID;
+            }
+
+            if (!parseGeometry)
+            {
+                byte[] bytes = new byte[srid != 0 ? len - 4 : len];
+                bytes[0] = (byte)bo;
+
+                if (bo == ByteOrder.LSB)
+                {
+                    bytes[1] = (byte)id;
+                    bytes[2] = (byte)(id >> 8);
+                    bytes[3] = (byte)(id >> 16);
+                    bytes[4] = (byte)(id >> 24);
+                }
+                else
+                {
+                    bytes[1] = (byte)(id >> 24);
+                    bytes[2] = (byte)(id >> 16);
+                    bytes[3] = (byte)(id >> 8);
+                    bytes[4] = (byte)id;
+                }
+
+                var wkbPos = 5;
+                var toRead = Math.Min(bytes.Length - wkbPos, buf.Size);
+                while (toRead > 0)
+                {
+                    await buf.Ensure(toRead, async);
+                    buf.ReadBytes(bytes, wkbPos, toRead);
+                    wkbPos += toRead;
+                    toRead = Math.Min(bytes.Length - wkbPos, buf.Size);
+                }
+
+                return new PostgisRawGeometry(srid, bytes);
             }
 
             var geom = await DoRead(buf, (WkbIdentifier)(id & 7), bo, async);
@@ -216,21 +268,22 @@ namespace Npgsql.TypeHandlers
         #endregion Read
 
         #region Read concrete types
-
+        async ValueTask<PostgisRawGeometry> IChunkingTypeHandler<PostgisRawGeometry>.Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription)
+            => (PostgisRawGeometry)await Read(buf, len, async, fieldDescription, false);
         async ValueTask<PostgisPoint> IChunkingTypeHandler<PostgisPoint>.Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription)
-            => (PostgisPoint)await Read(buf, len, async, fieldDescription);
+            => (PostgisPoint)await Read(buf, len, async, fieldDescription, true);
         async ValueTask<PostgisMultiPoint> IChunkingTypeHandler<PostgisMultiPoint>.Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription)
-            => (PostgisMultiPoint)await Read(buf, len, async, fieldDescription);
+            => (PostgisMultiPoint)await Read(buf, len, async, fieldDescription, true);
         async ValueTask<PostgisLineString> IChunkingTypeHandler<PostgisLineString>.Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription)
-            => (PostgisLineString)await Read(buf, len, async, fieldDescription);
+            => (PostgisLineString)await Read(buf, len, async, fieldDescription, true);
         async ValueTask<PostgisMultiLineString> IChunkingTypeHandler<PostgisMultiLineString>.Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription)
-            => (PostgisMultiLineString)await Read(buf, len, async, fieldDescription);
+            => (PostgisMultiLineString)await Read(buf, len, async, fieldDescription, true);
         async ValueTask<PostgisPolygon> IChunkingTypeHandler<PostgisPolygon>.Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription)
-            => (PostgisPolygon)await Read(buf, len, async, fieldDescription);
+            => (PostgisPolygon)await Read(buf, len, async, fieldDescription, true);
         async ValueTask<PostgisMultiPolygon> IChunkingTypeHandler<PostgisMultiPolygon>.Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription)
-            => (PostgisMultiPolygon)await Read(buf, len, async, fieldDescription);
+            => (PostgisMultiPolygon)await Read(buf, len, async, fieldDescription, true);
         async ValueTask<PostgisGeometryCollection> IChunkingTypeHandler<PostgisGeometryCollection>.Read(ReadBuffer buf, int len, bool async, FieldDescription fieldDescription)
-            => (PostgisGeometryCollection)await Read(buf, len, async, fieldDescription);
+            => (PostgisGeometryCollection)await Read(buf, len, async, fieldDescription, true);
 
         #endregion
 
@@ -263,6 +316,11 @@ namespace Npgsql.TypeHandlers
             return Write((PostgisGeometry)value, buf, lengthCache, parameter, async, cancellationToken);
         }
 
+        static uint AdjustByteOrder(uint x, bool swap)
+        {
+            return swap ? ((x & 0x000000FF) << 24) | ((x & 0x0000FF00) << 8) | ((x & 0x00FF0000) >> 8) | ((x & 0xFF000000) >> 24) : x;
+        }
+
         async Task Write(PostgisGeometry geom, WriteBuffer buf, LengthCache lengthCache, NpgsqlParameter parameter,
             bool async, CancellationToken cancellationToken)
         {
@@ -271,20 +329,40 @@ namespace Npgsql.TypeHandlers
             {
                 if (buf.WriteSpaceLeft < 5)
                     await buf.Flush(async, cancellationToken);
-                buf.WriteByte(0); // We choose to ouput only XDR structure
-                buf.WriteInt32((int)geom.Identifier);
+                ByteOrder byteOrder = geom.ByteOrder;
+                buf.WriteByte((byte)byteOrder);
+                buf.WriteUInt32(AdjustByteOrder(geom.WkbType, byteOrder == ByteOrder.LSB));
             }
             else
             {
                 if (buf.WriteSpaceLeft < 9)
                     await buf.Flush(async, cancellationToken);
-                buf.WriteByte(0);
-                buf.WriteInt32((int) ((uint)geom.Identifier | (uint)EwkbModifiers.HasSRID));
-                buf.WriteInt32((int) geom.SRID);
+                ByteOrder byteOrder = geom.ByteOrder;
+                buf.WriteByte((byte)byteOrder);
+                buf.WriteUInt32(AdjustByteOrder(geom.WkbType | (uint)EwkbModifiers.HasSRID, byteOrder == ByteOrder.LSB));
+                buf.WriteUInt32(AdjustByteOrder(geom.SRID, byteOrder == ByteOrder.LSB));
             }
 
             switch (geom.Identifier)
             {
+            case WkbIdentifier.Raw:
+                var raw = (PostgisRawGeometry)geom;
+                var wkbPos = 5;
+                while (true)
+                {
+                    var bytesToWrite = Math.Min(raw.Wkb.Length - wkbPos, buf.WriteSpaceLeft);
+                    if (bytesToWrite > 0)
+                    {
+                        buf.WriteBytes(raw.Wkb, wkbPos, bytesToWrite);
+                        wkbPos += bytesToWrite;
+                    }
+                    if (wkbPos == raw.Wkb.Length)
+                        break;
+
+                    await buf.Flush(async, cancellationToken);
+                }
+                return;
+
             case WkbIdentifier.Point:
                 if (buf.WriteSpaceLeft < 16)
                     await buf.Flush(async, cancellationToken);
